@@ -26,6 +26,33 @@ CREATE TABLE IF NOT EXISTS staged (
     data       TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL          -- change_seq：全局变更序号，每次成功发版 +1
+);
+CREATE TABLE IF NOT EXISTS qc_marks (
+    mark_id    TEXT PRIMARY KEY,    -- 取数标记（随机 id，持久化，重启后仍可用）
+    row0       INTEGER NOT NULL,    -- 取数窗口（整图坐标，含端点）
+    col0       INTEGER NOT NULL,
+    row1       INTEGER NOT NULL,
+    col1       INTEGER NOT NULL,
+    fetch_seq  INTEGER NOT NULL,    -- 取数时刻的全局变更序号
+    created_at TEXT NOT NULL
+    -- 注意：只存窗口范围与序号，不另存窗口高程副本
+);
+CREATE TABLE IF NOT EXISTS qc_isolations (
+    row        INTEGER NOT NULL,    -- 坏点全图坐标；共边上的同一格点只占一行
+    col        INTEGER NOT NULL,
+    mark_id    TEXT NOT NULL,       -- 由哪次提交隔离（审计用）
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (row, col)          -- 重复标记同一读数只隔离一次
+);
+CREATE TABLE IF NOT EXISTS point_changes (
+    row        INTEGER NOT NULL,    -- 格点全图坐标
+    col        INTEGER NOT NULL,
+    change_seq INTEGER NOT NULL,    -- 最近一次"实际改变该点高程"的发版序号
+    PRIMARY KEY (row, col)
+);
 """
 
 BUSY_TIMEOUT_MS = 30000

@@ -232,3 +232,130 @@ def test_mixed_workload_no_5xx_and_final_state_consistent(server):
                                  timeout=30).json()["data"]
                     assert tile[16] == down[0]
         assert grid["grid_rows"] == 16 * info["rows"] + 1
+
+
+def test_window_fetch_consistent_while_isolation_lifted(server):
+    """隔离解除与高程变更必须原子可见：并发取窗只能读到 null（仍隔离）
+    或某个已发版的新值，绝不允许读到"旧值但已解除隔离"的跨状态组合。"""
+    with httpx.Client() as c:
+        assert c.post(f"{server.url}/basemap",
+                      json={"grid": full_grid(1, 1, 100)},
+                      timeout=30).status_code == 201
+        r = c.post(f"{server.url}/qc/windows",
+                   json={"row0": 0, "col0": 0, "row1": 16, "col1": 16},
+                   timeout=30)
+        mark = r.json()["mark"]
+        r = c.post(f"{server.url}/qc/isolations",
+                   json={"mark": mark, "points": [{"row": 3, "col": 3}]},
+                   timeout=30)
+        assert r.status_code == 200
+
+    stop = threading.Event()
+    violations = []
+
+    def reader():
+        with httpx.Client() as c:
+            while not stop.is_set():
+                try:
+                    r = c.get(f"{server.url}/basemap/window",
+                              params={"row0": 3, "col0": 3,
+                                      "row1": 3, "col1": 3},
+                              timeout=30)
+                except httpx.HTTPError:
+                    continue
+                if r.status_code != 200:
+                    violations.append(f"status {r.status_code}")
+                    continue
+                v = r.json()["grid"][0][0]
+                # 合法：None（仍隔离）或某个已发版的新值（>=1000）；
+                # 读到旧值 100 说明高程与隔离状态不来自同一已提交状态
+                if v is not None and v < 1000:
+                    violations.append(f"stale combination: {v}")
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    for th in readers:
+        th.start()
+
+    rounds = 8
+    with httpx.Client() as c:
+        for k in range(rounds):
+            t = tile_grid(100)
+            t[3][3] = 1000 + k
+            resp = _post(c, f"{server.url}/tiles/0/0/staged", {"data": t})
+            assert resp is not None and resp.status_code == 201
+            resp = _post(c, f"{server.url}/publish", {"row": 0, "col": 0})
+            assert resp is not None and resp.status_code == 200, resp.text
+            # 第一次发版实际改变了该点 -> 解除隔离；之后该点已无隔离可解
+            expected = [[3, 3]] if k == 0 else []
+            assert resp.json()["lifted_isolations"] == expected
+
+    stop.set()
+    for th in readers:
+        th.join(timeout=60)
+
+    assert violations == []
+    with httpx.Client() as c:
+        final = c.get(f"{server.url}/basemap/window",
+                      params={"row0": 3, "col0": 3, "row1": 3, "col1": 3},
+                      timeout=30)
+    assert final.json()["grid"][0][0] == 1000 + rounds - 1
+
+
+def test_qc_workload_under_concurrent_publishes(server):
+    """质检取窗/提交与发版并发：不允许 5xx；结束后隔离状态自洽。"""
+    with httpx.Client() as c:
+        assert c.post(f"{server.url}/basemap",
+                      json={"grid": full_grid(1, 1, 100)},
+                      timeout=30).status_code == 201
+
+    stop = threading.Event()
+    problems = []
+    deadline = time.time() + 5
+
+    def qc_worker():
+        with httpx.Client() as c:
+            while time.time() < deadline:
+                r = _post(c, f"{server.url}/qc/windows",
+                          {"row0": 0, "col0": 0, "row1": 16, "col1": 16})
+                if r is None or r.status_code != 201:
+                    problems.append(f"qc_window: {r and r.status_code}")
+                    continue
+                r = _post(c, f"{server.url}/qc/isolations",
+                          {"mark": r.json()["mark"],
+                           "points": [{"row": 5, "col": 5}]})
+                # 200 成功；409 窗口在取数后被改过（整单退回）——都合法
+                if r is None or r.status_code not in (200, 409):
+                    problems.append(f"submit: {r and r.status_code}")
+
+    def publisher():
+        k = 0
+        with httpx.Client() as c:
+            while time.time() < deadline:
+                t = tile_grid(100)
+                t[5][5] = 1000 + k
+                r = _post(c, f"{server.url}/tiles/0/0/staged", {"data": t})
+                if r is None or r.status_code != 201:
+                    problems.append(f"stage: {r and r.status_code}")
+                r = _post(c, f"{server.url}/publish", {"row": 0, "col": 0})
+                if r is None or r.status_code != 200:
+                    problems.append(f"publish: {r and r.status_code}")
+                k += 1
+
+    threads = [threading.Thread(target=qc_worker) for _ in range(2)]
+    threads.append(threading.Thread(target=publisher))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=120)
+    stop.set()
+
+    assert problems == []
+
+    # 最终状态自洽：每个生效的隔离点在窗口 API 中都是 null
+    with httpx.Client() as c:
+        iso = c.get(f"{server.url}/qc/isolations", timeout=30).json()["points"]
+        grid = c.get(f"{server.url}/basemap/window",
+                     params={"row0": 0, "col0": 0, "row1": 16, "col1": 16},
+                     timeout=30).json()["grid"]
+        for p in iso:
+            assert grid[p["row"]][p["col"]] is None

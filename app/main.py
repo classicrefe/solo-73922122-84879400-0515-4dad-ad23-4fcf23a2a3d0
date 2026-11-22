@@ -11,7 +11,8 @@ import os
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from .models import BasemapCreate, PublishRequest, StageCreate
+from .models import (BasemapCreate, PublishRequest, QCIsolationSubmit,
+                     QCWindowCreate, StageCreate)
 from .service import (ElevationService, InvalidShape, ServiceError,
                       tiles_from_grid)
 
@@ -31,7 +32,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "数据员按块暂存修测，再点名一块发版：点名块必须换上最新暂存版，"
             "其余块可保留或换上各自最新暂存版，服务自动选出换块最少且所有共边"
             "逐点吻合的方案整批生效；无解时报告冲突边两侧瓦片坐标且不改任何数据。"
-            "暂存、发版、整图取数并发时满足可串行化。"))
+            "暂存、发版、取数、质检并发时满足可串行化。"
+            "质检流程：`POST /qc/windows` 取窗拿到窗内原高程与取数标记 → "
+            "`POST /qc/isolations` 带标记提交窗内坏点（全图坐标）→ 坏点在 "
+            "`GET /basemap/window` 中返回 null（隔离，坡度作业自动跳过）；"
+            "只有该点高程随发版实际改变才解除隔离、恢复供数。"))
 
     @app.exception_handler(ServiceError)
     async def _service_error_handler(_, exc: ServiceError):
@@ -104,6 +109,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
               summary="点名一块发版：换块最少且共边吻合的方案整批生效")
     def publish(body: PublishRequest):
         return service.publish(body.row, body.col)
+
+    # ---- 质检 ------------------------------------------------------------
+
+    @app.post("/qc/windows", status_code=201, tags=["质检"],
+              summary="质检取窗：返回窗内原高程与取数标记（不遮蔽隔离点）")
+    def qc_window(body: QCWindowCreate):
+        return service.create_qc_window(body.row0, body.col0,
+                                        body.row1, body.col1)
+
+    @app.post("/qc/isolations", tags=["质检"],
+              summary="带标记提交窗内坏点（全图坐标）；"
+                      "窗内任一点自取数后被改过则整单退回")
+    def qc_submit(body: QCIsolationSubmit):
+        return service.submit_isolations(
+            body.mark, [(p.row, p.col) for p in body.points])
+
+    @app.get("/qc/isolations", tags=["质检"],
+             summary="当前生效的隔离点列表（全图坐标）")
+    def qc_list():
+        return service.list_isolations()
 
     return app
 

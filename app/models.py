@@ -49,3 +49,25 @@ class StageCreate(BaseModel):
 class PublishRequest(BaseModel):
     row: int = Field(ge=0, description="被点名发版的瓦片行号")
     col: int = Field(ge=0, description="被点名发版的瓦片列号")
+
+
+class QCWindowCreate(BaseModel):
+    """质检取窗：整图坐标系下的矩形窗口（含端点）。"""
+
+    row0: int = Field(ge=0)
+    col0: int = Field(ge=0)
+    row1: int = Field(ge=0)
+    col1: int = Field(ge=0)
+
+
+class GridPoint(BaseModel):
+    row: int = Field(ge=0, description="坏点的全图行坐标")
+    col: int = Field(ge=0, description="坏点的全图列坐标")
+
+
+class QCIsolationSubmit(BaseModel):
+    """带取数标记提交窗内坏点（全图坐标）。"""
+
+    mark: str = Field(min_length=1, description="质检取窗返回的取数标记")
+    points: list[GridPoint] = Field(min_length=1,
+                                    description="窗内坏点的全图坐标列表")
